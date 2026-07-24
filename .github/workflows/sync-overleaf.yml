@@ -1,0 +1,79 @@
+name: Sync paper from Overleaf
+
+# Mirrors this project's Overleaf manuscript into paper/ on a schedule.
+#
+# Overleaf is the SOURCE OF TRUTH. This sync is one-way (Overleaf -> GitHub):
+# anything you edit under paper/ here will be overwritten on the next run.
+# Edit the paper in Overleaf, not in this repo.
+#
+# Requires:
+#   secret   OVERLEAF_TOKEN       - Overleaf git token (Account Settings > Git integration)
+#   variable OVERLEAF_PROJECT_ID  - the id from https://www.overleaf.com/project/<id>
+# If either is missing the job exits quietly instead of failing.
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # every 6 hours
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: overleaf-sync
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check configuration
+        id: guard
+        env:
+          OVERLEAF_TOKEN: ${{ secrets.OVERLEAF_TOKEN }}
+          OVERLEAF_PROJECT_ID: ${{ vars.OVERLEAF_PROJECT_ID }}
+        run: |
+          if [ -z "$OVERLEAF_TOKEN" ] || [ -z "$OVERLEAF_PROJECT_ID" ]; then
+            echo "::notice::OVERLEAF_TOKEN or OVERLEAF_PROJECT_ID not set — skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.guard.outputs.skip == 'false'
+
+      - name: Pull from Overleaf into paper/
+        if: steps.guard.outputs.skip == 'false'
+        env:
+          OVERLEAF_TOKEN: ${{ secrets.OVERLEAF_TOKEN }}
+          OVERLEAF_PROJECT_ID: ${{ vars.OVERLEAF_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          # credentials come from the env, never written to disk or logs
+          if ! git -c credential.helper= \
+                 clone --depth 1 --quiet \
+                 "https://git:${OVERLEAF_TOKEN}@git.overleaf.com/${OVERLEAF_PROJECT_ID}" \
+                 "$tmp/overleaf" 2>/dev/null; then
+            echo "::error::Could not clone Overleaf project ${OVERLEAF_PROJECT_ID} (bad id, revoked token, or no access)."
+            exit 1
+          fi
+          rm -rf "$tmp/overleaf/.git"
+          mkdir -p paper
+          rsync -a --delete "$tmp/overleaf/" paper/
+          rm -rf "$tmp"
+
+      - name: Commit if changed
+        if: steps.guard.outputs.skip == 'false'
+        run: |
+          if [ -z "$(git status --porcelain paper/)" ]; then
+            echo "No changes from Overleaf."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add paper/
+          git commit -m "chore(paper): sync from Overleaf"
+          git push
+          echo "Pushed updated paper/."
