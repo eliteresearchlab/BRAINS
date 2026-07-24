@@ -1,0 +1,105 @@
+name: Sync artifacts to Hugging Face
+
+# Publishes this project's datasets and model weights to the lab's Hugging Face
+# org (https://huggingface.co/eliteresearch) whenever they change on main.
+#
+#   data/    ->  eliteresearch/<repo>-data    (dataset repo, private)
+#   models/  ->  eliteresearch/<repo>-model   (model repo, private)
+#
+# Large artifacts (multi-GB weights, big corpora) should NOT be committed here —
+# GitHub blocks files over 100MB. Push those straight to Hugging Face and keep
+# only a pointer in this repo.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'data/**'
+      - 'models/**'
+  workflow_dispatch:
+
+concurrency:
+  group: hf-sync-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for HF_TOKEN
+        id: guard
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "::notice::HF_TOKEN org secret is not set — skipping sync."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.guard.outputs.skip == 'false'
+        with:
+          lfs: true
+
+      - uses: actions/setup-python@v5
+        if: steps.guard.outputs.skip == 'false'
+        with:
+          python-version: '3.11'
+
+      - name: Install huggingface_hub
+        if: steps.guard.outputs.skip == 'false'
+        run: pip install --quiet "huggingface_hub>=0.25"
+
+      - name: Upload to Hugging Face
+        if: steps.guard.outputs.skip == 'false'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GH_REPO: ${{ github.event.repository.name }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from huggingface_hub import HfApi
+
+          ORG = "eliteresearch"
+          IGNORE = {".gitkeep", ".gitignore", ".gitattributes"}
+
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          gh_repo = os.environ["GH_REPO"]
+          sha = os.environ.get("GIT_SHA", "")[:7]
+
+          targets = [
+              ("data",   "dataset", f"{ORG}/{gh_repo}-data"),
+              ("models", "model",   f"{ORG}/{gh_repo}-model"),
+          ]
+
+          synced = False
+          for folder, repo_type, repo_id in targets:
+              path = Path(folder)
+              if not path.is_dir():
+                  continue
+              files = [f for f in path.rglob("*") if f.is_file() and f.name not in IGNORE]
+              if not files:
+                  print(f"{folder}/ is empty — skipping")
+                  continue
+
+              total_mb = sum(f.stat().st_size for f in files) / 1048576
+              print(f"{folder}/ -> {repo_id}  ({len(files)} files, {total_mb:.1f} MB)")
+
+              api.create_repo(repo_id, repo_type=repo_type, private=True, exist_ok=True)
+              api.upload_folder(
+                  folder_path=str(path),
+                  repo_id=repo_id,
+                  repo_type=repo_type,
+                  commit_message=f"Sync from {gh_repo}@{sha}",
+              )
+              prefix = "datasets/" if repo_type == "dataset" else ""
+              print(f"  https://huggingface.co/{prefix}{repo_id}")
+              synced = True
+
+          if not synced:
+              print("No data/ or models/ content to sync.")
+          PY
